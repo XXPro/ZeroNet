@@ -44,10 +44,10 @@ class UiRequestPlugin(object):
         upload_info = upload_nonces[nonce]
         del upload_nonces[nonce]
 
-        self.sendHeader(200, "text/html", noscript=True, extra_headers=[
-            ("Access-Control-Allow-Origin", "null"),
-            ("Access-Control-Allow-Credentials", "true")
-        ])
+        self.sendHeader(200, "text/html", noscript=True, extra_headers={
+            "Access-Control-Allow-Origin": "null",
+            "Access-Control-Allow-Credentials": "true"
+        })
 
         self.readMultipartHeaders(self.env['wsgi.input'])  # Skip http headers
 
@@ -61,14 +61,15 @@ class UiRequestPlugin(object):
 
         if len(piecemap_info["sha512_pieces"]) == 1:  # Small file, don't split
             hash = piecemap_info["sha512_pieces"][0].encode("hex")
-            site.content_manager.optionalDownloaded(inner_path, hash, upload_info["size"], own=True)
+            hash_id = site.content_manager.hashfield.getHashId(hash)
+            site.content_manager.optionalDownloaded(inner_path, hash_id, upload_info["size"], own=True)
 
         else:  # Big file
             file_name = helper.getFilename(inner_path)
             msgpack.pack({file_name: piecemap_info}, site.storage.open(upload_info["piecemap"], "wb"))
 
             # Find piecemap and file relative path to content.json
-            file_info = site.content_manager.getFileInfo(inner_path)
+            file_info = site.content_manager.getFileInfo(inner_path, new_file=True)
             content_inner_path_dir = helper.getDirname(file_info["content_inner_path"])
             piecemap_relative_path = upload_info["piecemap"][len(content_inner_path_dir):]
             file_relative_path = inner_path[len(content_inner_path_dir):]
@@ -88,8 +89,11 @@ class UiRequestPlugin(object):
                 "piece_size": piece_size
             }
 
-            site.content_manager.optionalDownloaded(inner_path, merkle_root, upload_info["size"], own=True)
+            merkle_root_hash_id = site.content_manager.hashfield.getHashId(merkle_root)
+            site.content_manager.optionalDownloaded(inner_path, merkle_root_hash_id, upload_info["size"], own=True)
             site.storage.writeJson(file_info["content_inner_path"], content)
+
+            site.content_manager.contents.loadItem(file_info["content_inner_path"])  # reload cache
 
         return {
             "merkle_root": merkle_root,
@@ -109,7 +113,10 @@ class UiRequestPlugin(object):
         if kwargs.get("file_size", 0) > 1024 * 1024 and kwargs.get("path_parts"):  # Only check files larger than 1MB
             path_parts = kwargs["path_parts"]
             site = self.server.site_manager.get(path_parts["address"])
-            kwargs["file_obj"] = site.storage.openBigfile(path_parts["inner_path"], prebuffer=2 * 1024 * 1024)
+            big_file = site.storage.openBigfile(path_parts["inner_path"], prebuffer=2 * 1024 * 1024)
+            if big_file:
+                kwargs["file_obj"] = big_file
+                kwargs["file_size"] = big_file.size
 
         return super(UiRequestPlugin, self).actionFile(file_path, *args, **kwargs)
 
@@ -140,12 +147,40 @@ class UiWebsocketPlugin(object):
             "piece_size": piece_size,
             "piecemap": inner_path + ".piecemap.msgpack"
         }
-        self.response(to, {
+        return {
             "url": "/ZeroNet-Internal/BigfileUpload?upload_nonce=" + nonce,
-            "pice_size": piece_size,
+            "piece_size": piece_size,
             "inner_path": inner_path,
             "file_relative_path": file_relative_path
-        })
+        }
+
+    def actionSiteSetAutodownloadBigfileLimit(self, to, limit):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        self.site.settings["autodownload_bigfile_size_limit"] = int(limit)
+        self.response(to, "ok")
+
+    def actionFileDelete(self, to, inner_path):
+        piecemap_inner_path = inner_path + ".piecemap.msgpack"
+        if self.hasFilePermission(inner_path) and self.site.storage.isFile(piecemap_inner_path):
+            # Also delete .piecemap.msgpack file if exists
+            self.log.debug("Deleting piecemap: %s" % piecemap_inner_path)
+            file_info = self.site.content_manager.getFileInfo(piecemap_inner_path)
+            if file_info:
+                content_json = self.site.storage.loadJson(file_info["content_inner_path"])
+                relative_path = file_info["relative_path"]
+                if relative_path in content_json.get("files_optional", {}):
+                    del content_json["files_optional"][relative_path]
+                    self.site.storage.writeJson(file_info["content_inner_path"], content_json)
+                    self.site.content_manager.loadContent(file_info["content_inner_path"], add_bad_files=False, force=True)
+                    try:
+                        self.site.storage.delete(piecemap_inner_path)
+                    except Exception, err:
+                        self.log.error("File %s delete error: %s" % (piecemap_inner_path, err))
+
+        return super(UiWebsocketPlugin, self).actionFileDelete(to, inner_path)
 
 
 @PluginManager.registerTo("ContentManager")
@@ -265,12 +300,14 @@ class ContentManagerPlugin(object):
                 piecemap_inner_path = inner_path + ".piecemap.msgpack"
 
                 msgpack.pack({file_name: piecemap_info}, self.site.storage.open(piecemap_inner_path, "wb"))
-                back.update(super(ContentManagerPlugin, self).hashFile(dir_inner_path, piecemap_relative_path, True))
+
+                back.update(super(ContentManagerPlugin, self).hashFile(dir_inner_path, piecemap_relative_path, optional=True))
 
         piece_num = int(math.ceil(float(file_size) / piece_size))
 
         # Add the merkle root to hashfield
-        self.optionalDownloaded(inner_path, hash, file_size, own=True)
+        hash_id = self.site.content_manager.hashfield.getHashId(hash)
+        self.optionalDownloaded(inner_path, hash_id, file_size, own=True)
         self.site.storage.piecefields[hash].fromstring("1" * piece_num)
 
         back[file_relative_path] = {"sha512": hash, "size": file_size, "piecemap": piecemap_relative_path, "piece_size": piece_size}
@@ -300,7 +337,7 @@ class ContentManagerPlugin(object):
 
         return self.verifyPiece(inner_path, pos_from, file)
 
-    def optionalDownloaded(self, inner_path, hash, size=None, own=False):
+    def optionalDownloaded(self, inner_path, hash_id, size=None, own=False):
         if "|" in inner_path:
             inner_path, file_range = inner_path.split("|")
             pos_from, pos_to = map(int, file_range.split("-"))
@@ -311,12 +348,18 @@ class ContentManagerPlugin(object):
             self.site.storage.piecefields[file_info["sha512"]][piece_i] = True
 
             # Only add to site size on first request
-            if hash in self.hashfield:
+            if hash_id in self.hashfield:
                 size = 0
+        elif size > 1024 * 1024:
+            file_info = self.getFileInfo(inner_path)
+            if file_info and "sha512" in file_info:  # We already have the file, but not in piecefield
+                sha512 = file_info["sha512"]
+                if sha512 not in self.site.storage.piecefields:
+                    self.site.storage.checkBigfile(inner_path)
 
-        return super(ContentManagerPlugin, self).optionalDownloaded(inner_path, hash, size, own)
+        return super(ContentManagerPlugin, self).optionalDownloaded(inner_path, hash_id, size, own)
 
-    def optionalRemove(self, inner_path, hash, size=None):
+    def optionalRemoved(self, inner_path, hash_id, size=None):
         if size and size > 1024 * 1024:
             file_info = self.getFileInfo(inner_path)
             sha512 = file_info["sha512"]
@@ -327,7 +370,7 @@ class ContentManagerPlugin(object):
             for key in self.site.bad_files.keys():
                 if key.startswith(inner_path + "|"):
                     del self.site.bad_files[key]
-        return super(ContentManagerPlugin, self).optionalRemove(inner_path, hash, size)
+        return super(ContentManagerPlugin, self).optionalRemoved(inner_path, hash_id, size)
 
 
 @PluginManager.registerTo("SiteStorage")
@@ -343,8 +386,13 @@ class SiteStoragePlugin(object):
 
     def createSparseFile(self, inner_path, size, sha512=None):
         file_path = self.getPath(inner_path)
+
+        file_dir = os.path.dirname(file_path)
+        if not os.path.isdir(file_dir):
+            os.makedirs(file_dir)
+
         f = open(file_path, 'wb')
-        f.truncate(size)
+        f.truncate(min(1024 * 1024 * 5, size))  # Only pre-allocate up to 5MB
         f.close()
         if os.name == "nt":
             startupinfo = subprocess.STARTUPINFO()
@@ -383,12 +431,12 @@ class SiteStoragePlugin(object):
         del content
         self.onUpdated(inner_path)
 
-    def openBigfile(self, inner_path, prebuffer=0):
+    def checkBigfile(self, inner_path):
         file_info = self.site.content_manager.getFileInfo(inner_path)
-        if file_info and "piecemap" not in file_info:  # It's not a big file
+        if not file_info or (file_info and "piecemap" not in file_info):  # It's not a big file
             return False
 
-        self.site.needFile(inner_path, blocking=False)  # Download piecemap
+        self.site.settings["has_bigfile"] = True
         file_path = self.getPath(inner_path)
         sha512 = file_info["sha512"]
         piece_num = int(math.ceil(float(file_info["size"]) / file_info["piece_size"]))
@@ -403,7 +451,13 @@ class SiteStoragePlugin(object):
         else:
             self.log.debug("Creating bigfile: %s" % inner_path)
             self.createSparseFile(inner_path, file_info["size"], sha512)
-            self.piecefields[sha512].fromstring(piece_data * "0")
+            self.piecefields[sha512].fromstring("0" * piece_num)
+        return True
+
+    def openBigfile(self, inner_path, prebuffer=0):
+        if not self.checkBigfile(inner_path):
+            return False
+        self.site.needFile(inner_path, blocking=False)  # Download piecemap
         return BigFile(self.site, inner_path, prebuffer=prebuffer)
 
 
@@ -424,7 +478,7 @@ class BigFile(object):
 
     def read(self, buff=64 * 1024):
         pos = self.f.tell()
-        read_until = pos + buff
+        read_until = min(self.size, pos + buff)
         requests = []
         # Request all required blocks
         while 1:
@@ -493,7 +547,8 @@ class WorkerManagerPlugin(object):
             if not self.site.storage.isFile(piecemap_inner_path):
                 # Start download piecemap
                 piecemap_task = super(WorkerManagerPlugin, self).addTask(piecemap_inner_path, priority=30)
-                if "|" not in inner_path and self.site.isDownloadable(inner_path) and file_info["size"] / 1024 / 1024 <= config.autodownload_bigfile_size_limit:
+                autodownload_bigfile_size_limit = self.site.settings.get("autodownload_bigfile_size_limit", config.autodownload_bigfile_size_limit)
+                if "|" not in inner_path and self.site.isDownloadable(inner_path) and file_info["size"] / 1024 / 1024 <= autodownload_bigfile_size_limit:
                     gevent.spawn_later(0.1, self.site.needFile, inner_path + "|all")  # Download all pieces
 
             if "|" in inner_path:
@@ -685,6 +740,6 @@ class SitePlugin(object):
 class ConfigPlugin(object):
     def createArguments(self):
         group = self.parser.add_argument_group("Bigfile plugin")
-        group.add_argument('--autodownload_bigfile_size_limit', help='Also download bigfiles until this limit if help distribute option is checked', default=1, metavar="MB", type=int)
+        group.add_argument('--autodownload_bigfile_size_limit', help='Also download bigfiles smaller than this limit if help distribute option is checked', default=1, metavar="MB", type=int)
 
         return super(ConfigPlugin, self).createArguments()

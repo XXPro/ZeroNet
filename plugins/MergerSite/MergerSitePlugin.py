@@ -112,8 +112,8 @@ class UiWebsocketPlugin(object):
                 ret[address] = merged_type
         self.response(to, ret)
 
-    def hasSitePermission(self, address):
-        if super(UiWebsocketPlugin, self).hasSitePermission(address):
+    def hasSitePermission(self, address, *args, **kwargs):
+        if super(UiWebsocketPlugin, self).hasSitePermission(address, *args, **kwargs):
             return True
         else:
             if self.site.address in [merger_site.address for merger_site in merged_to_merger.get(address, [])]:
@@ -135,9 +135,7 @@ class UiWebsocketPlugin(object):
             req_self.site = self.server.sites.get(merged_address)  # Change the site to the merged one
 
             func = getattr(super(UiWebsocketPlugin, req_self), func_name)
-            back = func(to, merged_inner_path, *args, **kwargs)
-
-            return back
+            return func(to, merged_inner_path, *args, **kwargs)
         else:
             func = getattr(super(UiWebsocketPlugin, self), func_name)
             return func(to, inner_path, *args, **kwargs)
@@ -160,11 +158,21 @@ class UiWebsocketPlugin(object):
     def actionFileRules(self, to, inner_path, *args, **kwargs):
         return self.mergerFuncWrapper("actionFileRules", to, inner_path, *args, **kwargs)
 
+    def actionFileNeed(self, to, inner_path, *args, **kwargs):
+        return self.mergerFuncWrapper("actionFileNeed", to, inner_path, *args, **kwargs)
+
     def actionOptionalFileInfo(self, to, inner_path, *args, **kwargs):
         return self.mergerFuncWrapper("actionOptionalFileInfo", to, inner_path, *args, **kwargs)
 
     def actionOptionalFileDelete(self, to, inner_path, *args, **kwargs):
         return self.mergerFuncWrapper("actionOptionalFileDelete", to, inner_path, *args, **kwargs)
+
+    def actionBigfileUploadInit(self, to, inner_path, *args, **kwargs):
+        back = self.mergerFuncWrapper("actionBigfileUploadInit", to, inner_path, *args, **kwargs)
+        if inner_path.startswith("merged-"):
+            merged_address, merged_inner_path = checkMergerPath(self.site.address, inner_path)
+            back["inner_path"] = "merged-%s/%s/%s" % (merged_db[merged_address], merged_address, back["inner_path"])
+        return back
 
     # Add support merger sites for file commands with privatekey parameter
     def mergerFuncWrapperWithPrivatekey(self, func_name, to, privatekey, inner_path, *args, **kwargs):
@@ -250,6 +258,7 @@ class SiteStoragePlugin(object):
             for address, merged_type in merged_db.iteritems()
             if merged_type in merger_types
         ]
+        found = 0
         for merged_site in merged_sites:
             self.log.debug("Loading merged site: %s" % merged_site)
             merged_type = merged_db[merged_site.address]
@@ -272,6 +281,9 @@ class SiteStoragePlugin(object):
                         yield merged_inner_path, merged_site.storage.getPath(file_inner_path)
                     else:
                         merged_site.log.error("[MISSING] %s" % file_inner_path)
+                    found += 1
+                    if found % 100 == 0:
+                        time.sleep(0.000001)  # Context switch to avoid UI block
 
     # Also notice merger sites on a merged site file change
     def onUpdated(self, inner_path, file=None):
